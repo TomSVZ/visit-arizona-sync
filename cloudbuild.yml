@@ -1,0 +1,17 @@
+steps:
+  # First, install npm dependencies
+  - name: 'gcr.io/cloud-builders/npm'
+    args: ['install']
+  # Second, deploy the function
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'functions'
+      - 'deploy'
+      - 'webflowAlgoliaSync' # The name of your function
+      - '--gen2'
+      - '--runtime=nodejs20'
+      - '--region=us-central1'
+      - '--source=.'
+      - '--trigger-http'
+      - '--allow-unauthenticated'
