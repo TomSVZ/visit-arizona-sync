@@ -1,0 +1,9 @@
+{
+  "name": "webflow-algolia-sync",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "algoliasearch": "^4.23.3",
+    "webflow-api": "^1.0.0"
+  }
+}
