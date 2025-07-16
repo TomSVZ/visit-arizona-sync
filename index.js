@@ -10,4 +10,4 @@ exports.webflowAlgoliaSync = (req, res) => {
   res.status(200).send("Hello from Algolia Sync!");
 };
 
-//triggering a new build
+//triggering a new build again
