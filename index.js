@@ -9,3 +9,5 @@ exports.webflowAlgoliaSync = (req, res) => {
   // Your logic to sync Webflow to Algolia will go here.
   res.status(200).send("Hello from Algolia Sync!");
 };
+
+//triggering a new build
