@@ -15,6 +15,9 @@ steps:
       - '--source=.'
       - '--trigger-http'
       - '--allow-unauthenticated'
+
+serviceAccount: 'projects/windy-duality-462803-k3/serviceAccounts/algolia@windy-duality-462803-k3.iam.gserviceaccount.com'
+
 # Add this block to fix the error
 options:
   logging: CLOUD_LOGGING_ONLY
