@@ -14,6 +14,7 @@ steps:
       - '--region=us-central1'
       - '--source=.'
       - '--trigger-http'
+      - '--entry-point=webflowToAlgolia'
 
 # Add this block to fix the error
 options:
