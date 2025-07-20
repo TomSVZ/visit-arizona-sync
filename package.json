@@ -1,9 +1,10 @@
 {
   "name": "webflow-algolia-sync",
   "version": "1.0.0",
+  "description": "Syncs Webflow CMS to Algolia via Webhooks",
   "main": "index.js",
   "dependencies": {
     "algoliasearch": "^4.23.3",
-    "webflow-api": "^1.0.0"
+    "webflow-api": "^3.1.3"
   }
 }
