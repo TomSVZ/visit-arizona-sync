@@ -28,7 +28,7 @@ async function verifyWebflowSignature(req, triggerType) {
     return false;
   }
 
-  const isValidRequest = await webflowClient.webhooks.verifySignature({
+  const isValidRequest = await webflow.webhooks.verifySignature({
     headers: req.headers,
     body: JSON.stringify(req.body),
     secret: getSigningSecret(secret)
