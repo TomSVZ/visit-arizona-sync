@@ -1,22 +1,62 @@
-// index.js for Google Cloud Function
+// index.js for Google Cloud Function - Optimized with temporary storage
 
 const algoliasearch = require('algoliasearch');
 const { WebflowClient } = require('webflow-api');
 
 // --- INITIALIZE CLIENTS ---
-// Securely access your API keys from environment variables
 const algoliaClient = algoliasearch(process.env.ALGOLIA_APP_ID, process.env.ALGOLIA_ADMIN_KEY);
 const webflow = new WebflowClient({ accessToken: process.env.WEBFLOW_API_TOKEN });
 
+// --- IN-MEMORY CACHE ---
+// This persists across function invocations within the same container instance
+let referenceCache = {};
+let cacheTimestamp = 0;
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes in milliseconds
+
 /**
- * Fetches all items from all reference collections defined in the config.
- * @returns {Promise<object>} A promise that resolves to a cache object.
- * The cache is structured as: { collectionId: { itemId: itemName, ... }, ... }
+ * Checks if the cache is still valid based on TTL
+ */
+function isCacheValid() {
+  return Date.now() - cacheTimestamp < CACHE_TTL;
+}
+
+/**
+ * Fetches a single reference item from Webflow and adds it to cache
+ * @param {string} itemId - The Webflow item ID
+ * @param {string} collectionId - The collection ID containing the item
+ * @returns {Promise<object|null>} The item data or null if not found
+ */
+async function fetchAndCacheReferenceItem(itemId, collectionId) {
+  try {
+    console.log(`🔍 Fetching missing reference item ${itemId} from collection ${collectionId}`);
+    const item = await webflow.collections.items.getItemLive(collectionId, itemId);
+
+    // Initialize collection cache if it doesn't exist
+    if (!referenceCache[collectionId]) {
+      referenceCache[collectionId] = {};
+    }
+
+    // Cache the item
+    const itemData = {
+      name: item.fieldData.name,
+      slug: item.fieldData.slug,
+    };
+    referenceCache[collectionId][itemId] = itemData;
+
+    console.log(`✅ Cached reference item: ${itemData.name} (${itemId})`);
+    return itemData;
+  } catch (error) {
+    console.error(`❌ Failed to fetch reference item ${itemId}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Builds initial reference cache for all collections (only on cold starts or cache expiry)
  */
 async function buildReferenceCache() {
-  console.log('Building reference cache...');
+  console.log('🏗️  Building reference cache...');
   const cache = {};
-  // Get all collection IDs from the tagCollections config
   const collectionIds = Object.values(CONFIG.tagCollections);
 
   await Promise.all(
@@ -25,47 +65,89 @@ async function buildReferenceCache() {
         const items = await getAllWebflowItems(collectionId);
         cache[collectionId] = {};
         for (const item of items) {
-          // Store both the name and the slug for flexibility
           cache[collectionId][item.id] = {
             name: item.fieldData.name,
             slug: item.fieldData.slug,
           };
         }
+        console.log(`  ✅ Cached ${items.length} items from collection ${collectionId}`);
       } catch (error) {
         console.error(`Failed to build cache for collection ${collectionId}:`, error.message);
       }
     })
   );
+
+  referenceCache = cache;
+  cacheTimestamp = Date.now();
   console.log('✅ Reference cache built successfully.');
   return cache;
 }
 
 /**
- * Looks up reference item names/slugs from a pre-built cache.
- * @param {string[]} itemIds - An array of Webflow item IDs.
- * @param {string} collectionId - The Webflow collection ID for the reference items.
- * @param {object} cache - The pre-built cache from buildReferenceCache.
- * @param {string} field - The field to extract, 'name' or 'slug'.
- * @returns {string[]} An array of names/slugs.
+ * Ensures reference cache is available and up-to-date
  */
-function getNamesFromCache(itemIds, collectionId, cache, field = 'name') {
-  if (!itemIds || itemIds.length === 0 || !cache[collectionId]) {
+async function ensureReferenceCache() {
+  if (!isCacheValid() || Object.keys(referenceCache).length === 0) {
+    console.log('📱 Cache expired or empty, rebuilding...');
+    await buildReferenceCache();
+  } else {
+    console.log('✅ Using existing valid cache');
+  }
+}
+
+/**
+ * Smart cache lookup that fetches missing items on-demand
+ * @param {string[]} itemIds - Array of Webflow item IDs
+ * @param {string} collectionId - The collection ID for the reference items
+ * @param {string} field - The field to extract ('name' or 'slug')
+ * @returns {Promise<string[]>} Array of names/slugs
+ */
+async function getReferencesWithFallback(itemIds, collectionId, field = 'name') {
+  if (!itemIds || itemIds.length === 0) {
     return [];
   }
 
-  return itemIds
-    .map((id) => cache[collectionId][id]?.[field]) // Safely access the name/slug
-    .filter(name => name != null); // Filter out any not found
+  // Ensure we have a cache
+  await ensureReferenceCache();
+
+  const results = [];
+  const missingIds = [];
+
+  // First pass: collect what we have and identify missing items
+  for (const id of itemIds) {
+    const cachedItem = referenceCache[collectionId]?.[id];
+    if (cachedItem) {
+      results.push(cachedItem[field]);
+    } else {
+      missingIds.push(id);
+    }
+  }
+
+  // Second pass: fetch missing items in parallel
+  if (missingIds.length > 0) {
+    console.log(`🔄 Found ${missingIds.length} missing reference items, fetching...`);
+    const fetchPromises = missingIds.map(id => fetchAndCacheReferenceItem(id, collectionId));
+    const fetchedItems = await Promise.all(fetchPromises);
+
+    // Add successfully fetched items to results
+    fetchedItems.forEach(item => {
+      if (item && item[field]) {
+        results.push(item[field]);
+      }
+    });
+  }
+
+  return results.filter(item => item != null);
 }
 
-// --- DATA TRANSFORMERS ---
-// This version ensures multi-reference fields are always arrays.
+// --- OPTIMIZED DATA TRANSFORMERS ---
 
-const transformEvent = (item, cache) => {
+const transformEvent = async (item) => {
   const { fieldData } = item;
   const startDate = fieldData['event-start-date'] ? new Date(fieldData['event-start-date']) : null;
   const endDate = fieldData['event-end-date'] ? new Date(fieldData['event-end-date']) : null;
   let dateInfo = {};
+
   if (startDate) {
     dateInfo = {
       startTimestamp: Math.floor(startDate.getTime() / 1000),
@@ -84,6 +166,14 @@ const transformEvent = (item, cache) => {
     };
   }
 
+  // Parallel reference lookups
+  const [categories, highlightTags, regions, cities] = await Promise.all([
+    getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
+    getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, 'slug'),
+    getReferencesWithFallback([].concat(fieldData['cities-towns'] || []), CONFIG.placeCollections['cities-towns'].collectionId, 'slug')
+  ]);
+
   return {
     objectID: item.id,
     Name: fieldData.name || null,
@@ -99,15 +189,24 @@ const transformEvent = (item, cache) => {
     locationName: fieldData['location-name'] || null,
     openingHours: fieldData['opening-hours'] || null,
     eventAdmission: fieldData['event-admission'] || null,
-    Categories: getNamesFromCache([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, cache, 'slug'),
-    highlightTags: getNamesFromCache([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, cache, 'slug'),
-    Regions: getNamesFromCache([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, cache, 'slug'),
-    Cities: getNamesFromCache([].concat(fieldData['cities-towns'] || []), CONFIG.placeCollections['cities-towns'].collectionId, cache, 'slug'),
+    Categories: categories,
+    highlightTags: highlightTags,
+    Regions: regions,
+    Cities: cities,
   };
 };
 
-const transformLikeALocal = (item, cache) => {
+const transformLikeALocal = async (item) => {
   const { fieldData } = item;
+
+  // Parallel reference lookups
+  const [categories, highlightTags, regions, cities] = await Promise.all([
+    getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
+    getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.cities || []), CONFIG.placeCollections['cities-towns'].collectionId, 'slug')
+  ]);
+
   return {
     objectID: item.id,
     Name: fieldData.name || null,
@@ -115,15 +214,25 @@ const transformLikeALocal = (item, cache) => {
     webflowLink: `/like-a-local/${fieldData.slug}`,
     thumbnailImage: fieldData['main-image']?.url || null,
     thumbnailAltText: fieldData['main-image-alt-text'] || fieldData['main-image']?.alt || null,
-    Categories: getNamesFromCache([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, cache, 'slug'),
-    highlightTags: getNamesFromCache([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, cache, 'slug'),
-    Regions: getNamesFromCache([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, cache, 'slug'),
-    Cities: getNamesFromCache([].concat(fieldData.cities || []), CONFIG.placeCollections['cities-towns'].collectionId, cache, 'slug'),
+    Categories: categories,
+    highlightTags: highlightTags,
+    Regions: regions,
+    Cities: cities,
   };
 };
 
-const transformExperience = (item, cache) => {
+const transformExperience = async (item) => {
   const { fieldData } = item;
+
+  // Parallel reference lookups
+  const [categories, highlightTags, regions, cities, amenities] = await Promise.all([
+    getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
+    getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.cities || []), CONFIG.placeCollections['cities-towns'].collectionId, 'slug'),
+    getReferencesWithFallback([].concat(fieldData.amenities || []), CONFIG.tagCollections.amenities, 'slug')
+  ]);
+
   return {
     objectID: item.id,
     Name: fieldData.name || null,
@@ -135,17 +244,23 @@ const transformExperience = (item, cache) => {
       lat: parseFloat(fieldData['latitude']),
       lng: parseFloat(fieldData['longitude']),
     } : null,
-    Categories: getNamesFromCache([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, cache, 'slug'),
-    highlightTags: getNamesFromCache([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, cache, 'slug'),
-    Regions: getNamesFromCache([].concat(fieldData.regions || []), CONFIG.tagCollections.regions, cache, 'slug'),
-    Cities: getNamesFromCache([].concat(fieldData.cities || []), CONFIG.placeCollections['cities-towns'].collectionId, cache, 'slug'),
-    Amenities: getNamesFromCache([].concat(fieldData.amenities || []), CONFIG.tagCollections.amenities, cache, 'slug'),
+    Categories: categories,
+    highlightTags: highlightTags,
+    Regions: regions,
+    Cities: cities,
+    Amenities: amenities,
   };
 };
 
-const transformPlace = (item, placeType, cache) => {
+const transformPlace = async (item, placeType) => {
   const { fieldData } = item;
   const toTitleCase = (str) => str ? str.toLowerCase().split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ') : null;
+
+  // Parallel reference lookups
+  const [region, highlightTags] = await Promise.all([
+    getReferencesWithFallback([fieldData.region], CONFIG.tagCollections.regions, 'slug'),
+    getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug')
+  ]);
 
   return {
     objectID: item.id,
@@ -159,15 +274,13 @@ const transformPlace = (item, placeType, cache) => {
       lng: parseFloat(fieldData['google-map-longitude']),
     } : null,
     placeType: placeType,
-    // This correctly remains a single value, as you requested.
-    Region: (getNamesFromCache([fieldData.region], CONFIG.tagCollections.regions, cache, 'slug'))[0] || null,
-    highlightTags: getNamesFromCache([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, cache, 'slug'),
+    Region: region[0] || null,
+    highlightTags: highlightTags,
     slug: fieldData.slug,
   };
-}
+};
 
 // --- CONFIGURATION OBJECT ---
-// Central hub for all mappings. Add new collections here.
 const CONFIG = {
   tagCollections: {
     categories: '683a4969614808c01cd0d48d',
@@ -175,13 +288,11 @@ const CONFIG = {
     amenities: '683bad94ae45c6b733768887',
     regions: '683a4969614808c01cd0d4d3',
   },
-  // Map Webflow Collection IDs to their Algolia index and transformer
   collectionMappings: {
     '683a4969614808c01cd0d408': { indexName: 'testing_cms_items', transformer: transformEvent },
     '683a4969614808c01cd0d443': { indexName: 'testing_cms_items_2', transformer: transformLikeALocal },
     '683a4969614808c01cd0d41f': { indexName: 'testing_cms_items', transformer: transformExperience },
   },
-  // Place collections have a special structure
   placeCollections: {
     'cities-towns': { collectionId: '683a4969614808c01cd0d51f', placeType: 'cities' },
     'rivers-lakes': { collectionId: '683a4969614808c01cd0d500', placeType: 'rivers-lakes' },
@@ -195,27 +306,21 @@ for (const key in CONFIG.placeCollections) {
   const { collectionId, placeType } = CONFIG.placeCollections[key];
   CONFIG.collectionMappings[collectionId] = {
     indexName: 'testing_cms_items',
-    // Update the function signature here to pass the cache through
-    transformer: (item, cache) => transformPlace(item, placeType, cache),
+    transformer: (item) => transformPlace(item, placeType),
   };
 }
 
 /**
- * Fetches all items from a Webflow collection, automatically handling pagination.
- * @param {string} collectionId - The ID of the Webflow collection.
- * @returns {Promise<object[]>} A promise that resolves to an array of all items.
+ * Fetches all items from a Webflow collection with pagination
  */
 async function getAllWebflowItems(collectionId) {
   const allItems = [];
   let offset = 0;
-  const limit = 100; // Webflow's max limit per request
+  const limit = 100;
 
   while (true) {
-    // Use the 'Live' version to get published items
     const { items } = await webflow.collections.items.listItemsLive(collectionId, { limit, offset });
-    if (items.length === 0) {
-      break; // No more items left
-    }
+    if (items.length === 0) break;
     allItems.push(...items);
     offset += limit;
   }
@@ -223,141 +328,130 @@ async function getAllWebflowItems(collectionId) {
 }
 
 /**
-* Performs a full synchronization of all configured Webflow collections to Algolia.
-* It fetches all items, transforms them, groups them by index, and atomically updates each index.
-*/
+ * Optimized full sync that uses caching
+ */
 async function handleFullSync() {
-  console.log('🚀 Starting full sync of all collections...');
+  console.log('🚀 Starting optimized full sync...');
 
-  // Build the cache first!
-  const referenceCache = await buildReferenceCache();
+  // Ensure we have a fresh cache for full sync
+  await buildReferenceCache();
 
   const recordsByIndex = {};
 
-  // 1. Fetch and transform all items from all collections concurrently
+  // Process all collections in parallel
   await Promise.all(Object.entries(CONFIG.collectionMappings).map(async ([collectionId, mapping]) => {
     try {
-      console.log(`⏳ Fetching & transforming items from collection: ${collectionId}`);
+      console.log(`⏳ Processing collection: ${collectionId}`);
       const webflowItems = await getAllWebflowItems(collectionId);
 
+      // Transform items in parallel with smart caching
       const transformedRecords = await Promise.all(
-        webflowItems.map(item => mapping.transformer(item, referenceCache))
+        webflowItems.map(item => mapping.transformer(item))
       );
 
-      // Group records by their destination Algolia index name
       if (!recordsByIndex[mapping.indexName]) {
         recordsByIndex[mapping.indexName] = [];
       }
       recordsByIndex[mapping.indexName].push(...transformedRecords);
-      console.log(`  ✅ Processed ${transformedRecords.length} items from ${collectionId} for index ${mapping.indexName}`);
+      console.log(`  ✅ Processed ${transformedRecords.length} items from ${collectionId}`);
     } catch (error) {
       console.error(`❌ Failed to process collection ${collectionId}:`, error);
     }
   }));
 
-  // 2. Atomically update each Algolia index with the full set of records
-  console.log('📡 Pushing aggregated records to Algolia...');
+  // Update Algolia indexes
+  console.log('📡 Updating Algolia indexes...');
   await Promise.all(Object.entries(recordsByIndex).map(async ([indexName, records]) => {
-    if (records.length === 0) {
-      console.log(`- No records to sync for index ${indexName}. Skipping.`);
-      return;
-    }
+    if (records.length === 0) return;
+
     try {
       const index = algoliaClient.initIndex(indexName);
-      // replaceAllObjects is atomic: it deletes all existing records 
-      // and replaces them with the new set in a single, safe operation.
-      await index.replaceAllObjects(records, {
-        autoGenerateObjectIDIfNotExist: false // Your transformers correctly set the objectID
-      });
-      console.log(`✨ Successfully synced ${records.length} total records to index: ${indexName}`);
+      await index.replaceAllObjects(records, { autoGenerateObjectIDIfNotExist: false });
+      console.log(`✨ Synced ${records.length} records to ${indexName}`);
     } catch (error) {
       console.error(`❌ Failed to sync index ${indexName}:`, error);
     }
   }));
 
-  console.log('🎉 Full sync complete!');
+  console.log('🎉 Optimized full sync complete!');
 }
 
 // --- MAIN CLOUD FUNCTION ---
-/**
- * Handles Webflow webhooks AND manual triggers to sync data with Algolia.
- *
- * @param {object} req The HTTP request object.
- * @param {object} res The HTTP response object.
- */
 exports.webflowToAlgolia = async (req, res) => {
-  // For manual syncs, check for a secret key to prevent unauthorized execution.
-  // The secret should be passed in the request body.
+  console.log(`🚀 Function invoked with trigger: ${req.body.triggerType || 'unknown'}`);
+
+  // Log cache status
+  console.log(`📊 Cache status: ${Object.keys(referenceCache).length} collections cached, ` +
+    `${isCacheValid() ? 'valid' : 'expired'} (age: ${Math.round((Date.now() - cacheTimestamp) / 1000)}s)`);
+
+  // Authorization check for manual sync
   if (req.body.triggerType === 'manual_sync_all') {
     if (req.body.secret !== process.env.SYNC_SECRET) {
-      console.warn('Unauthorized manual_sync_all attempt received.');
+      console.warn('❌ Unauthorized manual sync attempt');
       return res.status(401).send('Unauthorized');
     }
   }
 
-  // Respond immediately to the caller to avoid timeouts.
-  // The actual sync process will continue in the background.
-  res.status(202).send('Request accepted. Processing will continue in the background.');
+  // Respond immediately
+  res.status(202).send('Request accepted. Processing in background.');
 
   try {
     const { triggerType, payload } = req.body;
-    console.log(`Processing trigger: ${triggerType}`);
 
-    // --- ROUTING LOGIC ---
-
-    // NEW: Handle the manual full sync trigger
     if (triggerType === 'manual_sync_all') {
       await handleFullSync();
 
-      // Case 1: An item was deleted or unpublished (existing logic)
     } else if (triggerType === 'collection_item_deleted' || triggerType === 'collection_item_unpublished') {
       const { id: itemId, collectionId } = payload;
       if (!itemId || !collectionId) {
-        console.warn('Delete trigger received without required IDs. Skipping.');
+        console.warn('⚠️  Delete trigger missing required IDs');
         return;
       }
+
       const mapping = CONFIG.collectionMappings[collectionId];
       if (!mapping) {
-        console.warn(`No mapping found for collection ID: ${collectionId}. Skipping delete.`);
+        console.warn(`⚠️  No mapping found for collection: ${collectionId}`);
         return;
       }
+
       const algoliaIndex = algoliaClient.initIndex(mapping.indexName);
       await algoliaIndex.deleteObject(itemId);
-      console.log(`✅ Successfully deleted item ${itemId} from index ${mapping.indexName}.`);
+      console.log(`🗑️  Deleted item ${itemId} from ${mapping.indexName}`);
 
-      // Case 2: One or more items were published or created (existing logic)
     } else if (triggerType === 'collection_item_published' || triggerType === 'collection_item_created') {
       const itemsToProcess = payload.items || [];
       if (itemsToProcess.length === 0) {
-        console.log('Publish trigger received with no items. Skipping.');
+        console.log('⚠️  No items to process');
         return;
       }
 
-      console.log(`🔄 Found ${itemsToProcess.length} item(s) to process.`);
+      console.log(`🔄 Processing ${itemsToProcess.length} item(s)...`);
 
-      // --- FIX: Build the reference cache before processing the update ---
-      const referenceCache = await buildReferenceCache();
-
+      // Process items in parallel
       await Promise.all(itemsToProcess.map(async (itemSummary) => {
         const { id: itemId, collectionId } = itemSummary;
         const mapping = CONFIG.collectionMappings[collectionId];
+
         if (!mapping) {
-          console.warn(`No mapping found for item ${itemId} in collection ${collectionId}. Skipping.`);
+          console.warn(`⚠️  No mapping for item ${itemId} in collection ${collectionId}`);
           return;
         }
-        const algoliaIndex = algoliaClient.initIndex(mapping.indexName);
-        const item = await webflow.collections.items.getItemLive(collectionId, itemId);
 
-        // Pass the newly built cache to the transformer
-        const algoliaRecord = mapping.transformer(item, referenceCache);
+        try {
+          const algoliaIndex = algoliaClient.initIndex(mapping.indexName);
+          const item = await webflow.collections.items.getItemLive(collectionId, itemId);
+          const algoliaRecord = await mapping.transformer(item);
 
-        await algoliaIndex.saveObject(algoliaRecord);
-        console.log(`✅ Successfully indexed item ${itemId} to index ${mapping.indexName}.`);
+          await algoliaIndex.saveObject(algoliaRecord);
+          console.log(`✅ Indexed item ${itemId} to ${mapping.indexName}`);
+        } catch (error) {
+          console.error(`❌ Failed to process item ${itemId}:`, error);
+        }
       }));
 
-      console.log('Finished processing batch.');
+      console.log('✅ Batch processing complete');
     }
   } catch (error) {
-    console.error('Error processing request:', error);
+    console.error('❌ Function error:', error);
   }
 };
