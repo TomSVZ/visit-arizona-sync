@@ -1,127 +1,164 @@
-// index.js for Google Cloud Function - Optimized with persistent storage
+// index.js - Main function compatible with both local and Google Cloud Function deployment
 
 const algoliasearch = require('algoliasearch');
 const { WebflowClient } = require('webflow-api');
-const { Storage } = require('@google-cloud/storage');
+
+// Conditional imports based on environment
+let fs, path, storage, bucketName;
+
+const isLocal = process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'local';
+
+if (isLocal) {
+  // Local development - use file system
+  fs = require('fs').promises;
+  path = require('path');
+} else {
+  // Google Cloud Function - use Cloud Storage
+  const { Storage } = require('@google-cloud/storage');
+  storage = new Storage();
+  bucketName = process.env.GCS_BUCKET_NAME;
+}
 
 // --- INITIALIZE CLIENTS ---
 const algoliaClient = algoliasearch(process.env.ALGOLIA_APP_ID, process.env.ALGOLIA_ADMIN_KEY);
-const webflow = new WebflowClient({ accessToken: process.env.WEBFLOW_API_TOKEN });
-const storage = new Storage();
-const bucketName = process.env.GCS_BUCKET_NAME; // Add this to your environment variables
+const webflow = new WebflowClient({
+  accessToken: process.env.WEBFLOW_API_TOKEN,
+  maxRetries: 10,
+  timeout: 60000 // Wait 60 seconds for a response from Webflow
+});
 
-// --- WEBHOOK VERIFICATION ---
+// --- STORAGE ABSTRACTION LAYER ---
+const CACHE_FILE = isLocal ?
+  (path ? path.join(__dirname, 'reference-cache.json') : 'reference-cache.json') :
+  'reference-cache.json';
+
+let referenceCache = {};
+let cacheLoaded = false;
+
 /**
- * Verifies Webflow webhook signature
+ * Processes an array of items in batches to avoid overwhelming APIs.
+ * @param {Array<T>} items The array of items to process.
+ * @param {number} batchSize The size of each chunk.
+ * @param {Function} fn The async function to call for each item.
+ * @returns {Promise<Array<R>>} A promise that resolves with an array of all results.
+ * @template T, R
  */
-async function verifyWebflowSignature(req, triggerType) {
-  const secretMap = {
-    'collection_item_published': process.env.WEBFLOW_PUBLISH_SECRET,
-    'collection_item_unpublished': process.env.WEBFLOW_UNPUBLISH_SECRET,
-    'collection_item_deleted': process.env.WEBFLOW_DELETE_SECRET
-  };
-
-  const secret = secretMap[triggerType];
-
-  if (!secret) {
-    console.warn(`No secret configured for trigger type: ${triggerType}`);
-    return false;
+async function processInBatches(items, batchSize, fn) {
+  let results = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(fn));
+    results = results.concat(batchResults);
+    // Optional: Add a small delay between batches if needed
+    // if (i + batchSize < items.length) {
+    //   await new Promise(resolve => setTimeout(resolve, 200));
+    // }
   }
-
-  const isValidRequest = await webflow.webhooks.verifySignature({
-    headers: req.headers,
-    body: JSON.stringify(req.body),
-    secret: secret
-  });
-
-  return isValidRequest;
+  return results;
 }
 
-// --- PERSISTENT STORAGE ---
-const CACHE_FILE = 'reference-cache.json';
-const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days for persistent storage
-// In-memory cache (warm container optimization)
-let referenceCache = {};
-let cacheTimestamp = 0;
-
 /**
- * Loads cache from Google Cloud Storage
+ * Load cache from storage (local file or GCS bucket)
  */
 async function loadCacheFromStorage() {
   try {
-    const file = storage.bucket(bucketName).file(CACHE_FILE);
-    const [exists] = await file.exists();
-
-    if (!exists) {
-      console.log('No persistent cache found, will build new one');
-      return { cache: {}, timestamp: 0 };
-    }
-
-    const [data] = await file.download();
-    const cacheData = JSON.parse(data.toString());
-
-    // Check if persistent cache is still valid
-    if (Date.now() - cacheData.timestamp < CACHE_TTL) {
-      console.log('📦 Loaded valid cache from persistent storage');
-      return { cache: cacheData.cache, timestamp: cacheData.timestamp };
+    if (isLocal) {
+      // Local file system
+      const data = await fs.readFile(CACHE_FILE, 'utf8');
+      const cacheData = JSON.parse(data);
+      console.log('📦 Loaded cache from local file');
+      return cacheData.cache || {};
     } else {
-      console.log('💾 Persistent cache expired, will rebuild');
-      return { cache: {}, timestamp: 0 };
+      // Google Cloud Storage
+      const file = storage.bucket(bucketName).file(CACHE_FILE);
+      const [exists] = await file.exists();
+
+      if (!exists) {
+        console.log('No cache found in GCS, will build new one');
+        return {};
+      }
+
+      const [data] = await file.download();
+      const cacheData = JSON.parse(data.toString());
+      console.log('📦 Loaded cache from Google Cloud Storage');
+      return cacheData.cache || {};
     }
   } catch (error) {
-    console.error('Failed to load cache from storage:', error.message);
-    return { cache: {}, timestamp: 0 };
+    if (isLocal && error.code === 'ENOENT') {
+      console.log('No local cache found, will build new one');
+    } else {
+      console.error('Failed to load cache from storage:', error.message);
+    }
+    return {};
   }
 }
 
 /**
- * Saves cache to Google Cloud Storage
+ * Save cache to storage (local file or GCS bucket)
  */
 async function saveCacheToStorage() {
   try {
-    const file = storage.bucket(bucketName).file(CACHE_FILE);
     const cacheData = {
       cache: referenceCache,
-      timestamp: cacheTimestamp
+      timestamp: Date.now(),
+      totalItems: Object.values(referenceCache).reduce((acc, collection) => acc + Object.keys(collection).length, 0)
     };
 
-    await file.save(JSON.stringify(cacheData), {
-      metadata: { contentType: 'application/json' }
-    });
-    console.log('💾 Cache saved to persistent storage');
+    if (isLocal) {
+      // Local file system
+      await fs.writeFile(CACHE_FILE, JSON.stringify(cacheData, null, 2));
+      console.log(`💾 Cache saved to local file (${cacheData.totalItems} items)`);
+    } else {
+      // Google Cloud Storage
+      const file = storage.bucket(bucketName).file(CACHE_FILE);
+      await file.save(JSON.stringify(cacheData), {
+        metadata: { contentType: 'application/json' }
+      });
+      console.log(`💾 Cache saved to GCS (${cacheData.totalItems} items)`);
+    }
   } catch (error) {
     console.error('Failed to save cache to storage:', error.message);
   }
 }
 
 /**
- * Checks if the in-memory cache is still valid
+ * Ensures reference cache is loaded (persistent, never expires)
  */
-function isCacheValid() {
-  return Date.now() - cacheTimestamp < CACHE_TTL && Object.keys(referenceCache).length > 0;
+async function ensureReferenceCache() {
+  if (cacheLoaded) {
+    return;
+  }
+
+  referenceCache = await loadCacheFromStorage();
+
+  // If cache is empty, build it
+  if (Object.keys(referenceCache).length === 0) {
+    await buildReferenceCache();
+  }
+
+  cacheLoaded = true;
 }
 
 /**
  * Fetches a single reference item from Webflow and adds it to cache
- * @param {string} itemId - The Webflow item ID
- * @param {string} collectionId - The collection ID containing the item
- * @returns {Promise<object|null>} The item data or null if not found
  */
 async function fetchAndCacheReferenceItem(itemId, collectionId) {
   try {
     const item = await webflow.collections.items.getItemLive(collectionId, itemId);
 
-    // Initialize collection cache if it doesn't exist
     if (!referenceCache[collectionId]) {
       referenceCache[collectionId] = {};
     }
 
-    // Cache the item
     const itemData = {
       name: item.fieldData.name,
       slug: item.fieldData.slug,
     };
     referenceCache[collectionId][itemId] = itemData;
+
+    // Save immediately when new items are added
+    await saveCacheToStorage();
+    console.log(`✅ Cached new reference item: ${itemData.name}`);
 
     return itemData;
   } catch (error) {
@@ -151,6 +188,7 @@ async function buildReferenceCache() {
           };
         }
         totalItems += items.length;
+        console.log(`  📋 Collection ${collectionId}: ${items.length} items`);
       } catch (error) {
         console.error(`Failed to build cache for collection ${collectionId}:`, error.message);
       }
@@ -158,55 +196,24 @@ async function buildReferenceCache() {
   );
 
   referenceCache = cache;
-  cacheTimestamp = Date.now();
-
-  // Save to persistent storage
   await saveCacheToStorage();
-
   console.log(`✅ Reference cache built with ${totalItems} total items`);
-  return cache;
 }
 
 /**
- * Ensures reference cache is available and up-to-date
- */
-async function ensureReferenceCache() {
-  // First check in-memory cache
-  if (isCacheValid()) {
-    return;
-  }
-
-  // Try loading from persistent storage
-  const { cache, timestamp } = await loadCacheFromStorage();
-  if (Object.keys(cache).length > 0) {
-    referenceCache = cache;
-    cacheTimestamp = timestamp;
-    return;
-  }
-
-  // Build new cache if nothing found
-  await buildReferenceCache();
-}
-
-/**
- * Smart cache lookup that fetches missing items on-demand
- * @param {string[]} itemIds - Array of Webflow item IDs
- * @param {string} collectionId - The collection ID for the reference items
- * @param {string} field - The field to extract ('name' or 'slug')
- * @returns {Promise<string[]>} Array of names/slugs
+ * Smart cache lookup - cache grows organically, never clears
  */
 async function getReferencesWithFallback(itemIds, collectionId, field = 'name') {
   if (!itemIds || itemIds.length === 0) {
     return [];
   }
 
-  // Ensure we have a cache
   await ensureReferenceCache();
 
   const results = [];
   const missingIds = [];
 
-  // First pass: collect what we have and identify missing items
+  // First pass: collect cached items and identify missing ones
   for (const id of itemIds) {
     const cachedItem = referenceCache[collectionId]?.[id];
     if (cachedItem) {
@@ -216,31 +223,64 @@ async function getReferencesWithFallback(itemIds, collectionId, field = 'name') 
     }
   }
 
-  // Second pass: fetch missing items in parallel
+  // Second pass: fetch missing items (cache grows organically)
   if (missingIds.length > 0) {
-    const fetchPromises = missingIds.map(id => fetchAndCacheReferenceItem(id, collectionId));
-    const fetchedItems = await Promise.all(fetchPromises);
+    if (isLocal) {
+      console.log(`🔍 Fetching ${missingIds.length} missing reference items in batches`);
+    }
 
-    // Add successfully fetched items to results and update persistent storage
-    let newItemsAdded = 0;
+    // Use the batching function to avoid rate limits
+    const BATCH_SIZE = 10; // Process 10 requests at a time
+    const fetchedItems = await processInBatches(
+      missingIds,
+      BATCH_SIZE,
+      id => fetchAndCacheReferenceItem(id, collectionId)
+    );
+
     fetchedItems.forEach(item => {
       if (item && item[field]) {
         results.push(item[field]);
-        newItemsAdded++;
       }
     });
-
-    // Save updated cache to storage if we added new items
-    if (newItemsAdded > 0) {
-      await saveCacheToStorage();
-    }
   }
 
   return results.filter(item => item != null);
 }
 
-// --- OPTIMIZED DATA TRANSFORMERS ---
+// --- WEBHOOK VERIFICATION ---
+async function verifyWebflowSignature(req, triggerType) {
+  // Skip verification in local development
+  if (isLocal) {
+    console.log('🔓 Skipping webhook verification in development mode');
+    return true;
+  }
 
+  const secretMap = {
+    'collection_item_published': process.env.WEBFLOW_PUBLISH_SECRET,
+    'collection_item_unpublished': process.env.WEBFLOW_UNPUBLISH_SECRET,
+    'collection_item_deleted': process.env.WEBFLOW_DELETE_SECRET
+  };
+
+  const secret = secretMap[triggerType];
+  if (!secret) {
+    console.warn(`No secret configured for trigger type: ${triggerType}`);
+    return false;
+  }
+
+  try {
+    const isValidRequest = await webflow.webhooks.verifySignature({
+      headers: req.headers,
+      body: JSON.stringify(req.body),
+      secret: secret
+    });
+    return isValidRequest;
+  } catch (error) {
+    console.error('Webhook verification failed:', error.message);
+    return false;
+  }
+}
+
+// --- DATA TRANSFORMERS ---
 const transformEvent = async (item) => {
   const { fieldData } = item;
   const startDate = fieldData['event-start-date'] ? new Date(fieldData['event-start-date']) : null;
@@ -265,7 +305,6 @@ const transformEvent = async (item) => {
     };
   }
 
-  // Parallel reference lookups
   const [categories, highlightTags, regions, cities] = await Promise.all([
     getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
     getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
@@ -298,7 +337,6 @@ const transformEvent = async (item) => {
 const transformLikeALocal = async (item) => {
   const { fieldData } = item;
 
-  // Parallel reference lookups
   const [categories, highlightTags, regions, cities] = await Promise.all([
     getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
     getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
@@ -323,7 +361,6 @@ const transformLikeALocal = async (item) => {
 const transformExperience = async (item) => {
   const { fieldData } = item;
 
-  // Parallel reference lookups
   const [categories, highlightTags, regions, cities, amenities] = await Promise.all([
     getReferencesWithFallback([].concat(fieldData.categories || []), CONFIG.tagCollections.categories, 'slug'),
     getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug'),
@@ -355,7 +392,6 @@ const transformPlace = async (item, placeType) => {
   const { fieldData } = item;
   const toTitleCase = (str) => str ? str.toLowerCase().split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ') : null;
 
-  // Parallel reference lookups
   const [region, highlightTags] = await Promise.all([
     getReferencesWithFallback([fieldData.region], CONFIG.tagCollections.regions, 'slug'),
     getReferencesWithFallback([].concat(fieldData['highlight-tags'] || []), CONFIG.tagCollections.highlightTags, 'slug')
@@ -379,7 +415,7 @@ const transformPlace = async (item, placeType) => {
   };
 };
 
-// --- CONFIGURATION OBJECT ---
+// --- CONFIGURATION ---
 const CONFIG = {
   tagCollections: {
     categories: '683a4969614808c01cd0d48d',
@@ -400,7 +436,7 @@ const CONFIG = {
   }
 };
 
-// Add place collections to the main mapping dynamically
+// Add place collections to main mapping
 for (const key in CONFIG.placeCollections) {
   const { collectionId, placeType } = CONFIG.placeCollections[key];
   CONFIG.collectionMappings[collectionId] = {
@@ -427,31 +463,24 @@ async function getAllWebflowItems(collectionId) {
 }
 
 /**
- * Optimized full sync with better performance monitoring
+ * Full sync handler
  */
 async function handleFullSync() {
   const startTime = Date.now();
-  console.log('🚀 Starting optimized full sync...');
+  console.log('🚀 Starting full sync...');
 
-  // Force fresh cache for full sync
-  await buildReferenceCache();
+  await ensureReferenceCache();
 
   const recordsByIndex = {};
   const collectionTimes = {};
 
-  // Process all collections in parallel with timing
   await Promise.all(Object.entries(CONFIG.collectionMappings).map(async ([collectionId, mapping]) => {
     const collectionStart = Date.now();
     try {
       const webflowItems = await getAllWebflowItems(collectionId);
-      const fetchTime = Date.now() - collectionStart;
-
-      // Transform items in parallel
-      const transformStart = Date.now();
       const transformedRecords = await Promise.all(
         webflowItems.map(item => mapping.transformer(item))
       );
-      const transformTime = Date.now() - transformStart;
 
       if (!recordsByIndex[mapping.indexName]) {
         recordsByIndex[mapping.indexName] = [];
@@ -459,26 +488,16 @@ async function handleFullSync() {
       recordsByIndex[mapping.indexName].push(...transformedRecords);
 
       const totalTime = Date.now() - collectionStart;
-      collectionTimes[collectionId] = {
-        items: webflowItems.length,
-        fetchTime,
-        transformTime,
-        totalTime
-      };
-
-      console.log(`  ✅ Collection ${collectionId}: ${webflowItems.length} items in ${totalTime}ms (fetch: ${fetchTime}ms, transform: ${transformTime}ms)`);
+      collectionTimes[collectionId] = { items: webflowItems.length, totalTime };
+      console.log(`  ✅ Collection ${collectionId}: ${webflowItems.length} items in ${totalTime}ms`);
     } catch (error) {
       console.error(`❌ Failed to process collection ${collectionId}:`, error);
     }
   }));
 
-  // Update Algolia indexes with timing
-  console.log('📡 Updating Algolia indexes...');
-  const algoliaStart = Date.now();
-
+  // Update Algolia
   await Promise.all(Object.entries(recordsByIndex).map(async ([indexName, records]) => {
     if (records.length === 0) return;
-
     try {
       const index = algoliaClient.initIndex(indexName);
       await index.replaceAllObjects(records, { autoGenerateObjectIDIfNotExist: false });
@@ -488,19 +507,7 @@ async function handleFullSync() {
     }
   }));
 
-  const algoliaTime = Date.now() - algoliaStart;
-  const totalTime = Date.now() - startTime;
-
-  console.log(`🎉 Full sync complete in ${totalTime}ms (Algolia upload: ${algoliaTime}ms)`);
-
-  // Performance breakdown
-  const slowestCollection = Object.entries(collectionTimes)
-    .sort(([, a], [, b]) => b.totalTime - a.totalTime)[0];
-
-  if (slowestCollection) {
-    const [id, times] = slowestCollection;
-    console.log(`⚠️  Slowest collection: ${id} (${times.totalTime}ms for ${times.items} items)`);
-  }
+  console.log(`🎉 Full sync complete in ${Date.now() - startTime}ms`);
 }
 
 // --- MAIN CLOUD FUNCTION ---
@@ -508,7 +515,7 @@ exports.webflowToAlgolia = async (req, res) => {
   const startTime = Date.now();
   const { triggerType } = req.body;
 
-  // Verify webhook signature for Webflow triggers
+  // Verify webhook signature for non-manual triggers
   if (triggerType && triggerType !== 'manual_sync_all') {
     if (!(await verifyWebflowSignature(req, triggerType))) {
       console.warn('❌ Invalid webhook signature');
@@ -516,7 +523,7 @@ exports.webflowToAlgolia = async (req, res) => {
     }
   }
 
-  // Authorization check for manual sync
+  // Auth check for manual sync
   if (triggerType === 'manual_sync_all') {
     if (req.body.secret !== process.env.SYNC_SECRET) {
       console.warn('❌ Unauthorized manual sync attempt');
@@ -525,8 +532,6 @@ exports.webflowToAlgolia = async (req, res) => {
   }
 
   console.log(`🚀 Processing: ${triggerType || 'unknown'}`);
-
-  // Respond immediately
   res.status(202).send('Request accepted. Processing in background.');
 
   try {
@@ -559,7 +564,6 @@ exports.webflowToAlgolia = async (req, res) => {
         return;
       }
 
-      // Process items in parallel
       await Promise.all(itemsToProcess.map(async (itemSummary) => {
         const { id: itemId, collectionId } = itemSummary;
         const mapping = CONFIG.collectionMappings[collectionId];
@@ -587,3 +591,35 @@ exports.webflowToAlgolia = async (req, res) => {
     console.error('❌ Function error:', error);
   }
 };
+
+// --- LOCAL DEVELOPMENT HELPERS ---
+if (isLocal) {
+  // Export additional helpers for local testing
+  exports.getCacheStatus = async () => {
+    await ensureReferenceCache();
+    const totalItems = Object.values(referenceCache).reduce((acc, collection) => acc + Object.keys(collection).length, 0);
+
+    return {
+      loaded: cacheLoaded,
+      totalCollections: Object.keys(referenceCache).length,
+      totalItems,
+      collections: Object.fromEntries(
+        Object.entries(referenceCache).map(([id, items]) => [id, Object.keys(items).length])
+      )
+    };
+  };
+
+  exports.rebuildCache = async () => {
+    console.log('🔄 Manual cache rebuild requested');
+    referenceCache = {};
+    cacheLoaded = false;
+    await buildReferenceCache();
+    return { success: true, message: 'Cache rebuilt successfully' };
+  };
+
+  exports.testSync = async () => {
+    console.log('🧪 Test sync requested');
+    await handleFullSync();
+    return { success: true, message: 'Test sync completed' };
+  };
+}
