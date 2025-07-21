@@ -23,7 +23,7 @@ if (isLocal) {
 const algoliaClient = algoliasearch(process.env.ALGOLIA_APP_ID, process.env.ALGOLIA_ADMIN_KEY);
 const webflow = new WebflowClient({
   accessToken: process.env.WEBFLOW_API_TOKEN,
-  maxRetries: 10,
+  maxRetries: 2,
   timeout: 60000 // Wait 60 seconds for a response from Webflow
 });
 
@@ -474,9 +474,10 @@ async function handleFullSync() {
   const recordsByIndex = {};
   const collectionTimes = {};
 
-  await Promise.all(Object.entries(CONFIG.collectionMappings).map(async ([collectionId, mapping]) => {
+  for (const [collectionId, mapping] of Object.entries(CONFIG.collectionMappings)) {
     const collectionStart = Date.now();
     try {
+      console.log(`⏳ Processing collection ${collectionId}...`);
       const webflowItems = await getAllWebflowItems(collectionId);
       const transformedRecords = await Promise.all(
         webflowItems.map(item => mapping.transformer(item))
@@ -491,9 +492,9 @@ async function handleFullSync() {
       collectionTimes[collectionId] = { items: webflowItems.length, totalTime };
       console.log(`  ✅ Collection ${collectionId}: ${webflowItems.length} items in ${totalTime}ms`);
     } catch (error) {
-      console.error(`❌ Failed to process collection ${collectionId}:`, error);
+      console.error(`❌ Failed to process collection ${collectionId}:`, error.message || error);
     }
-  }));
+  }
 
   // Update Algolia
   await Promise.all(Object.entries(recordsByIndex).map(async ([indexName, records]) => {
