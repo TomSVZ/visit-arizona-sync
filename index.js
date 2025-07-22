@@ -422,9 +422,9 @@ const CONFIG = {
     regions: '683a4969614808c01cd0d4d3',
   },
   collectionMappings: {
-    '683a4969614808c01cd0d408': { indexName: 'testing_cms_items', transformer: transformEvent },
-    '683a4969614808c01cd0d443': { indexName: 'testing_cms_items_2', transformer: transformLikeALocal },
-    '683a4969614808c01cd0d41f': { indexName: 'testing_cms_items', transformer: transformExperience },
+    '683a4969614808c01cd0d408': { indexName: 'events_cms_items', transformer: transformEvent },
+    '683a4969614808c01cd0d443': { indexName: 'like_a_local_cms_items', transformer: transformLikeALocal },
+    '683a4969614808c01cd0d41f': { indexName: 'experiences_cms_items', transformer: transformExperience },
   },
   placeCollections: {
     'cities-towns': { collectionId: '683a4969614808c01cd0d51f', placeType: 'cities' },
@@ -438,7 +438,7 @@ const CONFIG = {
 for (const key in CONFIG.placeCollections) {
   const { collectionId, placeType } = CONFIG.placeCollections[key];
   CONFIG.collectionMappings[collectionId] = {
-    indexName: 'testing_cms_items',
+    indexName: 'places_cms_items',
     transformer: (item) => transformPlace(item, placeType),
   };
 }
