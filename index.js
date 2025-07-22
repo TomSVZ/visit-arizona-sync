@@ -375,9 +375,9 @@ const transformExperience = async (item) => {
     webflowLink: `/directory/${fieldData.slug}`,
     thumbnailImage: fieldData['main-image']?.url || null,
     thumbnailAltText: fieldData['main-image']?.alt || null,
-    _geoloc: (fieldData['latitude'] && fieldData['longitude']) ? {
-      lat: parseFloat(fieldData['latitude']),
-      lng: parseFloat(fieldData['longitude']),
+    _geoloc: (fieldData['google-maps-latitude'] && fieldData['google-maps-longitude']) ? {
+      lat: parseFloat(fieldData['google-maps-latitude']),
+      lng: parseFloat(fieldData['google-maps-longitude']),
     } : null,
     Categories: categories,
     highlightTags: highlightTags,
