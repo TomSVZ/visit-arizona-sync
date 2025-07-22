@@ -49,11 +49,6 @@ async function processInBatches(items, batchSize, fn) {
     const batch = items.slice(i, i + batchSize);
     const batchResults = await Promise.all(batch.map(fn));
     results = results.concat(batchResults);
-
-    // This delay between batches helps avoid rate limits
-    if (i + batchSize < items.length) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
   }
   return results;
 }
