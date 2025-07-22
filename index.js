@@ -282,7 +282,7 @@ async function verifyWebflowSignature(req, triggerType) {
 // --- DATA TRANSFORMERS ---
 const transformEvent = async (item) => {
   const { fieldData } = item;
-  const startDate = fieldData['event-start-date'] ? new Date(fieldData['event-start-date']) : null;
+  const startDate = fieldData['date'] ? new Date(fieldData['date']) : null;
   const endDate = fieldData['event-end-date'] ? new Date(fieldData['event-end-date']) : null;
   let dateInfo = {};
 
