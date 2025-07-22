@@ -156,9 +156,7 @@ async function fetchAndCacheReferenceItem(itemId, collectionId) {
     };
     referenceCache[collectionId][itemId] = itemData;
 
-    // Save immediately when new items are added
-    await saveCacheToStorage();
-    console.log(`✅ Cached new reference item: ${itemData.name}`);
+    console.log(`📝 Updated cache in memory for: ${itemData.name}`);
 
     return itemData;
   } catch (error) {
@@ -196,7 +194,7 @@ async function buildReferenceCache() {
   );
 
   referenceCache = cache;
-  await saveCacheToStorage();
+
   console.log(`✅ Reference cache built with ${totalItems} total items`);
 }
 
@@ -511,6 +509,8 @@ async function handleFullSync() {
     }
   }));
 
+  await saveCacheToStorage();
+
   console.log(`🎉 Full sync complete in ${Date.now() - startTime}ms`);
 }
 
@@ -595,6 +595,8 @@ exports.webflowToAlgolia = async (req, res) => {
     console.error('❌ Function error:', error);
   }
 };
+
+await saveCacheToStorage();
 
 // --- LOCAL DEVELOPMENT HELPERS ---
 if (isLocal) {
