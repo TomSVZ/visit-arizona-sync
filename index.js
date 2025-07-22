@@ -594,9 +594,12 @@ exports.webflowToAlgolia = async (req, res) => {
   } catch (error) {
     console.error('❌ Function error:', error);
   }
+
+  await saveCacheToStorage();
+
 };
 
-await saveCacheToStorage();
+
 
 // --- LOCAL DEVELOPMENT HELPERS ---
 if (isLocal) {
