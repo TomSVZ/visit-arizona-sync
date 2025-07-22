@@ -479,8 +479,11 @@ async function handleFullSync() {
     try {
       console.log(`⏳ Processing collection ${collectionId}...`);
       const webflowItems = await getAllWebflowItems(collectionId);
-      const transformedRecords = await Promise.all(
-        webflowItems.map(item => mapping.transformer(item))
+      const BATCH_SIZE = 10; // Process 10 items at a time.
+      const transformedRecords = await processInBatches(
+        webflowItems,
+        BATCH_SIZE,
+        item => mapping.transformer(item)
       );
 
       if (!recordsByIndex[mapping.indexName]) {
