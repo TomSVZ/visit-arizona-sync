@@ -391,6 +391,7 @@ const transformLikeALocal = async (item) => {
     highlightTags: highlightTags,
     Regions: regions,
     Cities: cities,
+    nonEnglishArticle: fieldData["non-english-article"] || false,
     ...dateInfo,
   };
 };
